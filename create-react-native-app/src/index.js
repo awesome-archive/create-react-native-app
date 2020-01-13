@@ -5,7 +5,7 @@
 // DON'T MODIFY THIS FILE
 // IF AT ALL POSSIBLE, MAKE ANY CHANGES IN THE SCRIPTS PACKAGE
 
-import fsp from 'fs-promise';
+import fse from 'fs-extra';
 import chalk from 'chalk';
 import minimist from 'minimist';
 import path from 'path';
@@ -20,6 +20,9 @@ const argv = minimist(process.argv.slice(2));
  *   --version - to print current version
  *   --verbose - to print npm logs during init
  *   --scripts-version <alternative package>
+ *   --reason - shortcut for: --scripts-version 'reason-react-native-scripts'
+ *   --typescript - shortcut for: --scripts-version 'react-native-scripts-ts'
+ *   --package-manager <package manager name or path>
  *     Example of valid values:
  *     - a specific npm version: "0.22.0-rc1"
  *     - a .tgz archive from npm: "https://registry.npmjs.org/react-native-scripts/-/react-native-scripts-0.20.0.tgz"
@@ -27,6 +30,7 @@ const argv = minimist(process.argv.slice(2));
  */
 const commands = argv._;
 const cwd = process.cwd();
+const packageManager = argv['package-manager'];
 
 if (commands.length === 0) {
   if (argv.version) {
@@ -38,10 +42,15 @@ if (commands.length === 0) {
   process.exit(1);
 }
 
-createApp(commands[0], !!argv.verbose, argv['scripts-version']).then(() => {});
+const scriptsVersion = argv.reason
+  ? 'reason-react-native-scripts'
+  : (argv.typescript
+    ?  'react-native-scripts-ts'
+    : argv['scripts-version']);
 
-// use yarn if it's available, otherwise use npm
-function shouldUseYarn() {
+createApp(commands[0], !!argv.verbose, scriptsVersion).then(() => {});
+
+function userHasYarn() {
   try {
     const result = spawn.sync('yarnpkg', ['--version'], { stdio: 'ignore' });
     if (result.error || result.status !== 0) {
@@ -53,16 +62,47 @@ function shouldUseYarn() {
   }
 }
 
+// This decides the 'interface' of the package managing command.
+// Ex: If it guesses the type of package manager as 'yarn',
+//     then it executes '(yarn) add' command instead of '(npm) install'.
+function packageManagerType() {
+  const defaultType = 'npm';
+  const supportedTypes = ['yarn', 'npm', 'pnpm'];
+
+  if (packageManager) {
+    let index = supportedTypes.indexOf(packageManager);
+    return index === -1 ? defaultType : supportedTypes[index];
+  }
+
+  return userHasYarn() ? 'yarn' : defaultType;
+}
+
+function packageManagerCmd() {
+  if (packageManager) {
+    return packageManager;
+  } else {
+    return packageManagerType() === 'yarn' ? 'yarnpkg' : 'npm';
+  }
+}
+
 async function createApp(name: string, verbose: boolean, version: ?string): Promise<void> {
   const root = path.resolve(name);
   const appName = path.basename(root);
 
   const packageToInstall = getInstallPackage(version);
   const packageName = getPackageName(packageToInstall);
+
+  if (packageToInstall === 'react-native-scripts') {
+    // The latest version of react-native-scripts is just a wrapper for expo-cli,
+    // so we can skip installing it and just run expo-cli directly.
+    runExpoCli('init', name);
+    return;
+  }
+
   checkAppName(appName, packageName);
 
   if (!await pathExists(name)) {
-    await fsp.mkdir(root);
+    await fse.mkdir(root);
   } else if (!await isSafeToCreateProjectIn(root)) {
     console.log(`The directory \`${name}\` contains file(s) that could conflict. Aborting.`);
     process.exit(1);
@@ -76,10 +116,13 @@ async function createApp(name: string, verbose: boolean, version: ?string): Prom
     version: '0.1.0',
     private: true,
   };
-  await fsp.writeFile(path.join(root, 'package.json'), JSON.stringify(packageJson, null, 2));
+  await fse.writeFile(path.join(root, 'package.json'), JSON.stringify(packageJson, null, 2));
   process.chdir(root);
 
-  console.log('Installing packages. This might take a couple minutes.');
+  console.log(
+    `Using package manager as ${packageManagerCmd()} with ${packageManagerType()} interface.`
+  );
+  console.log('Installing packages. This might take a couple of minutes.');
   console.log('Installing react-native-scripts...');
   console.log();
 
@@ -91,11 +134,11 @@ function install(
   verbose: boolean,
   callback: (code: number, command: string, args: Array<string>) => Promise<void>
 ): void {
-  const useYarn = shouldUseYarn();
-  let args, cmd, result;
+  const type = packageManagerType();
+  let args, result;
+  let cmd = packageManagerCmd();
 
-  if (useYarn) {
-    cmd = 'yarnpkg';
+  if (type === 'yarn') {
     args = ['add'];
 
     if (verbose) {
@@ -110,7 +153,6 @@ function install(
     if (verbose) {
       args.push('--verbose');
     }
-    cmd = 'npm';
     args = args.concat(['--save-dev', '--save-exact', packageToInstall]);
 
     result = spawn.sync(cmd, args, { stdio: 'inherit' });
@@ -159,7 +201,7 @@ function getInstallPackage(version: ?string): string {
   let packageToInstall = 'react-native-scripts';
   const validSemver = semver.valid(version);
   if (validSemver) {
-    packageToInstall += '@' + validSemver;
+    packageToInstall += `@${validSemver}`;
   } else if (version) {
     // for tar.gz or alternative paths
     packageToInstall = version;
@@ -190,7 +232,7 @@ function getPackageName(installPackage: string): string {
 async function checkNodeVersion(packageName: string): Promise<void> {
   const packageJsonPath = path.resolve(process.cwd(), 'node_modules', packageName, 'package.json');
 
-  const packageJson = JSON.parse(await fsp.readFile(packageJsonPath));
+  const packageJson = JSON.parse(await fse.readFile(packageJsonPath));
   if (!packageJson.engines || !packageJson.engines.node) {
     return;
   }
@@ -242,7 +284,41 @@ function checkAppName(appName: string, packageName: string): void {
 // If project only contains files generated by GH, it’s safe
 async function isSafeToCreateProjectIn(root: string): Promise<boolean> {
   const validFiles = ['.DS_Store', 'Thumbs.db', '.git', '.gitignore', 'README.md', 'LICENSE'];
-  return (await fsp.readdir(root)).every(file => {
+  return (await fse.readdir(root)).every(file => {
     return validFiles.indexOf(file) >= 0;
   });
+}
+
+function runExpoCli(...args) {
+  spawn('expo-cli', args, { stdio: 'inherit' })
+    .on('exit', function(code) {
+      process.exit(code);
+    })
+    .on('error', function() {
+      console.warn('This command requires Expo CLI.');
+      var rl = require('readline').createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      rl.question('Do you want to install it globally [Y/n]? ', function(answer) {
+        rl.close();
+        if (/^n/i.test(answer.trim())) {
+          process.exit(1);
+        } else {
+          console.log("Installing the package 'expo-cli'...");
+          spawn('npm', ['install', '--global', '--loglevel', 'error', 'expo-cli@latest'], {
+            stdio: ['inherit', 'ignore', 'inherit'],
+          }).on('close', function(code) {
+            if (code !== 0) {
+              console.error('Installing Expo CLI failed. You can install it manually with:');
+              console.error('  npm install --global expo-cli');
+              process.exit(code);
+            } else {
+              console.log('Expo CLI installed. You can run `expo --help` for instructions.');
+              runExpoCli(...args);
+            }
+          });
+        }
+      });
+    });
 }
